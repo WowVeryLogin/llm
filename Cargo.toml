@@ -1,0 +1,11 @@
+[package]
+name = "llm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rand = "0.10.1"
+rand_distr = "0.6"
+ndarray = { "version" = "0.17.2", features = ["std", "matrixmultiply-threading", "blas"] }
+blas-src = { version = "0.10", features = ["accelerate"] }
+rayon = "1.12"
