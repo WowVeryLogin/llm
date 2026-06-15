@@ -1,5 +1,7 @@
 use blas_src as _;
-use ndarray::{Array, Array1, Array2, Array3, Array4, ArrayRef1, Axis, Dimension, s};
+use ndarray::{
+    Array, Array1, Array2, Array3, ArrayRef1, ArrayView2, ArrayViewMut2, Axis, Dimension, Zip, s,
+};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::{Rng, RngExt};
@@ -9,13 +11,13 @@ use std::{collections::HashMap, error::Error, fs};
 
 const BATCH_SIZE: usize = 64;
 const BLOCK_SIZE: usize = 256;
-const MAX_ITERS: usize = 5000;
+const MAX_ITERS: usize = 2000;
 const EVAL_INTERVAL: usize = 500;
 const EVAL_ITERS: usize = 200;
 const LEARNING_RATE: f32 = 3e-4;
 const N_EMBD: usize = 128;
 const N_HEAD: usize = 4;
-const N_LAYER: usize = 3;
+const N_LAYER: usize = 2;
 const DROPOUT: f32 = 0.2;
 const SEED: u64 = 1337;
 const DROPOUT_CHUNK_SIZE: usize = 4096;
@@ -73,6 +75,15 @@ struct AdamStep {
     lr: f32,
     eps: f32,
     weight_decay: f32,
+}
+
+impl AdamStep {
+    fn without_weight_decay(self) -> Self {
+        Self {
+            weight_decay: 0.0,
+            ..self
+        }
+    }
 }
 
 impl AdamW {
@@ -143,6 +154,10 @@ impl Param2D {
         self.value *= 1.0 - step.lr * step.weight_decay;
         self.value -= &update;
     }
+
+    fn step_without_weight_decay(&mut self, step: AdamStep) {
+        self.step(step.without_weight_decay());
+    }
 }
 
 struct Param1D {
@@ -176,6 +191,7 @@ impl Param1D {
     }
 
     fn step(&mut self, step: AdamStep) {
+        let step = step.without_weight_decay();
         self.m = step.beta1 * &self.m + (1.0 - step.beta1) * &self.grad;
         self.v = step.beta2 * &self.v + (1.0 - step.beta2) * &self.grad * &self.grad;
 
@@ -183,7 +199,6 @@ impl Param1D {
         let v_hat = &self.v / step.beta2_correction;
         let update = step.lr * m_hat / (v_hat.mapv(f32::sqrt) + step.eps);
 
-        self.value *= 1.0 - step.lr * step.weight_decay;
         self.value -= &update;
     }
 }
@@ -207,34 +222,54 @@ impl Linear {
     }
 
     fn forward(&self, input: &Array3<f32>) -> Array3<f32> {
-        let (batch, time, _) = input.dim();
+        let (batch, time, in_features) = input.dim();
         let out_features = self.weight.value.dim().1;
-        let mut output = Array3::zeros((batch, time, out_features));
-        for (b, mut out) in output.outer_iter_mut().enumerate() {
-            out.assign(&input.index_axis(Axis(0), b).dot(&self.weight.value));
-            if let Some(bias) = &self.bias {
-                for mut row in out.outer_iter_mut() {
-                    row += &bias.value;
-                }
+        let input_flat = ArrayView2::from_shape(
+            (batch * time, in_features),
+            input
+                .as_slice_memory_order()
+                .expect("linear input should be contiguous"),
+        )
+        .unwrap();
+        let mut output_flat = input_flat.dot(&self.weight.value);
+        if let Some(bias) = &self.bias {
+            for mut row in output_flat.outer_iter_mut() {
+                row += &bias.value;
             }
         }
 
-        output
+        let (output, offset) = output_flat.into_raw_vec_and_offset();
+        assert_eq!(offset, Some(0));
+        Array3::from_shape_vec((batch, time, out_features), output).unwrap()
     }
 
     fn backward(&mut self, input: &Array3<f32>, grad_output: &Array3<f32>) -> Array3<f32> {
-        let mut grad_input = Array3::zeros(input.dim());
-        for (b, mut out) in grad_input.outer_iter_mut().enumerate() {
-            let input_batch = input.slice(s![b, .., ..]);
-            let grad_batch = grad_output.slice(s![b, .., ..]);
-            self.weight.grad += &input_batch.t().dot(&grad_batch);
-            if let Some(bias) = &mut self.bias {
-                bias.grad += &grad_batch.sum_axis(Axis(0));
-            }
-            out.assign(&grad_batch.dot(&self.weight.value.t()));
-        }
+        let (batch, time, in_features) = input.dim();
+        let out_features = self.weight.value.dim().1;
+        let input_flat = ArrayView2::from_shape(
+            (batch * time, in_features),
+            input
+                .as_slice_memory_order()
+                .expect("linear input should be contiguous"),
+        )
+        .unwrap();
+        let grad_output_flat = ArrayView2::from_shape(
+            (batch * time, out_features),
+            grad_output
+                .as_slice_memory_order()
+                .expect("linear gradient output should be contiguous"),
+        )
+        .unwrap();
 
-        grad_input
+        self.weight.grad += &input_flat.t().dot(&grad_output_flat);
+        if let Some(bias) = &mut self.bias {
+            bias.grad += &grad_output_flat.sum_axis(Axis(0));
+        }
+        let grad_input_flat = grad_output_flat.dot(&self.weight.value.t());
+
+        let (grad_input, offset) = grad_input_flat.into_raw_vec_and_offset();
+        assert_eq!(offset, Some(0));
+        Array3::from_shape_vec((batch, time, in_features), grad_input).unwrap()
     }
 
     fn zero_grad(&mut self) {
@@ -258,6 +293,11 @@ struct LayerNorm {
     eps: f32,
 }
 
+struct LayerNormCache {
+    x_hat: Array3<f32>,
+    inv_std: Array2<f32>,
+}
+
 impl LayerNorm {
     fn new(channels: usize) -> Self {
         Self {
@@ -267,37 +307,48 @@ impl LayerNorm {
         }
     }
 
-    fn forward(&self, input: &Array3<f32>) -> Array3<f32> {
+    fn forward(&self, input: &Array3<f32>) -> (Array3<f32>, LayerNormCache) {
         let (batch, time, channels) = input.dim();
         let mut output = Array3::zeros((batch, time, channels));
+        let mut x_hat_cache = Array3::zeros((batch, time, channels));
+        let mut inv_std_cache = Array2::zeros((batch, time));
 
         for (b, mut out) in output.outer_iter_mut().enumerate() {
             for (t, mut out) in out.outer_iter_mut().enumerate() {
                 let row = input.slice(s![b, t, ..]);
                 let mean = row.sum() / channels as f32;
-                let var = row.var(0.0);
+                let var = row
+                    .iter()
+                    .map(|value| {
+                        let centered = value - mean;
+                        centered * centered
+                    })
+                    .sum::<f32>()
+                    / channels as f32;
                 let inv_std = 1.0 / (var + self.eps).sqrt();
                 let x_hat = row.mapv(|value| (value - mean) * inv_std);
                 out.assign(&(&self.gamma.value * &x_hat + &self.beta.value));
+                x_hat_cache.slice_mut(s![b, t, ..]).assign(&x_hat);
+                inv_std_cache[[b, t]] = inv_std;
             }
         }
 
-        output
+        (
+            output,
+            LayerNormCache {
+                x_hat: x_hat_cache,
+                inv_std: inv_std_cache,
+            },
+        )
     }
 
-    fn backward(&mut self, input: &Array3<f32>, grad_output: &Array3<f32>) -> Array3<f32> {
-        let mut grad_input = Array3::zeros(input.dim());
+    fn backward(&mut self, cache: &LayerNormCache, grad_output: &Array3<f32>) -> Array3<f32> {
+        let mut grad_input = Array3::zeros(grad_output.dim());
         for (b, mut out) in grad_input.outer_iter_mut().enumerate() {
             for (t, mut out) in out.outer_iter_mut().enumerate() {
-                let input_row = input.slice(s![b, t, ..]);
                 let grad_row = grad_output.slice(s![b, t, ..]);
-
-                let mean = input_row.mean().unwrap();
-                let var = input_row.var(0.0);
-
-                let inv_std = 1.0 / (var + self.eps).sqrt();
-
-                let x_hat = input_row.mapv(|value| (value - mean) * inv_std);
+                let x_hat = cache.x_hat.slice(s![b, t, ..]);
+                let inv_std = cache.inv_std[[b, t]];
 
                 self.gamma.grad += &(&grad_row * &x_hat);
                 self.beta.grad += &grad_row;
@@ -330,12 +381,12 @@ impl LayerNorm {
 
 struct AttentionCache {
     input: Array3<f32>,
-    q: Array4<f32>,
-    k: Array4<f32>,
-    v: Array4<f32>,
-    att_probs: Array4<f32>,
-    att_dropped: Array4<f32>,
-    att_dropout_mask: Option<Array4<f32>>,
+    q: Array3<f32>,
+    k: Array3<f32>,
+    v: Array3<f32>,
+    att_probs: Array3<f32>,
+    att_dropped: Array3<f32>,
+    att_dropout_mask: Option<Array3<f32>>,
     context: Array3<f32>,
     proj_dropout_mask: Option<Array3<f32>>,
 }
@@ -345,17 +396,103 @@ struct MultiHeadSelfAttention {
     head_size: usize,
     qkv: Linear,
     proj: Linear,
+    causal_mask: Array2<bool>,
 }
 
 impl MultiHeadSelfAttention {
-    fn new<R: Rng + ?Sized>(n_embd: usize, n_head: usize, rng: &mut R) -> Self {
+    fn new<R: Rng + ?Sized>(n_embd: usize, n_head: usize, block_size: usize, rng: &mut R) -> Self {
         assert_eq!(n_embd % n_head, 0, "n_embd must be divisible by n_head");
+        let mut causal_mask = Array2::from_elem((block_size, block_size), false);
+        for i in 0..block_size {
+            if i + 1 < block_size {
+                causal_mask.slice_mut(s![i, i + 1..]).fill(true);
+            }
+        }
+
         Self {
             n_head,
             head_size: n_embd / n_head,
             qkv: Linear::new(n_embd, 3 * n_embd, false, rng),
             proj: Linear::new(n_embd, n_embd, true, rng),
+            causal_mask,
         }
+    }
+
+    fn pack_qkv(&self, qkv: &Array3<f32>) -> (Array3<f32>, Array3<f32>, Array3<f32>) {
+        let (batch, time, qkv_channels) = qkv.dim();
+        let n_embd = self.n_head * self.head_size;
+        assert_eq!(qkv_channels, 3 * n_embd);
+
+        let heads = batch * self.n_head;
+        let mut q = Array3::zeros((heads, time, self.head_size));
+        let mut k = Array3::zeros((heads, time, self.head_size));
+        let mut v = Array3::zeros((heads, time, self.head_size));
+        let head_values = time * self.head_size;
+
+        q.as_slice_memory_order_mut()
+            .expect("packed q should be contiguous")
+            .par_chunks_mut(head_values)
+            .zip(
+                k.as_slice_memory_order_mut()
+                    .expect("packed k should be contiguous")
+                    .par_chunks_mut(head_values),
+            )
+            .zip(
+                v.as_slice_memory_order_mut()
+                    .expect("packed v should be contiguous")
+                    .par_chunks_mut(head_values),
+            )
+            .enumerate()
+            .for_each(|(head_idx, ((q_out, k_out), v_out))| {
+                let b = head_idx / self.n_head;
+                let h = head_idx % self.n_head;
+                let start = h * self.head_size;
+                let end = start + self.head_size;
+                let mut q_out = ArrayViewMut2::from_shape((time, self.head_size), q_out).unwrap();
+                let mut k_out = ArrayViewMut2::from_shape((time, self.head_size), k_out).unwrap();
+                let mut v_out = ArrayViewMut2::from_shape((time, self.head_size), v_out).unwrap();
+
+                q_out.assign(&qkv.slice(s![b, .., start..end]));
+                k_out.assign(&qkv.slice(s![b, .., n_embd + start..n_embd + end]));
+                v_out.assign(&qkv.slice(s![b, .., 2 * n_embd + start..2 * n_embd + end]));
+            });
+
+        (q, k, v)
+    }
+
+    fn unpack_qkv_grads(
+        &self,
+        grad_q: &Array3<f32>,
+        grad_k: &Array3<f32>,
+        grad_v: &Array3<f32>,
+        batch: usize,
+        time: usize,
+    ) -> Array3<f32> {
+        let n_embd = self.n_head * self.head_size;
+        let mut grad_qkv = Array3::zeros((batch, time, 3 * n_embd));
+        let batch_values = time * 3 * n_embd;
+
+        grad_qkv
+            .as_slice_memory_order_mut()
+            .expect("qkv gradients should be contiguous")
+            .par_chunks_mut(batch_values)
+            .enumerate()
+            .for_each(|(b, out)| {
+                let mut out = ArrayViewMut2::from_shape((time, 3 * n_embd), out).unwrap();
+                for h in 0..self.n_head {
+                    let head_idx = b * self.n_head + h;
+                    let start = h * self.head_size;
+                    let end = start + self.head_size;
+                    out.slice_mut(s![.., start..end])
+                        .assign(&grad_q.index_axis(Axis(0), head_idx));
+                    out.slice_mut(s![.., n_embd + start..n_embd + end])
+                        .assign(&grad_k.index_axis(Axis(0), head_idx));
+                    out.slice_mut(s![.., 2 * n_embd + start..2 * n_embd + end])
+                        .assign(&grad_v.index_axis(Axis(0), head_idx));
+                }
+            });
+
+        grad_qkv
     }
 
     fn forward<R: Rng + ?Sized>(
@@ -367,66 +504,55 @@ impl MultiHeadSelfAttention {
     ) -> (Array3<f32>, AttentionCache) {
         let (batch, time, n_embd) = input.dim();
         let qkv = self.qkv.forward(input);
-
-        let mut q = Array4::zeros((batch, self.n_head, time, self.head_size));
-        let mut k = Array4::zeros((batch, self.n_head, time, self.head_size));
-        let mut v = Array4::zeros((batch, self.n_head, time, self.head_size));
-
-        // let qkv = qkv
-        //     .into_shape_with_order((batch, time, 3, self.n_head, self.head_size))
-        //     .unwrap()
-        //     .permuted_axes([0, 3, 1, 2, 4]);
-        // let mut q = qkv.slice(s![.., .., .., 0, ..]).to_owned();
-        // let mut k = qkv.slice(s![.., .., .., 1, ..]).to_owned();
-        // let mut v = qkv.slice(s![.., .., .., 2, ..]).to_owned();
-
-        for h in 0..self.n_head {
-            let start = h * self.head_size;
-            let end = start + self.head_size;
-            q.slice_mut(s![.., h, .., ..])
-                .assign(&qkv.slice(s![.., .., start..end]));
-            k.slice_mut(s![.., h, .., ..]).assign(&qkv.slice(s![
-                ..,
-                ..,
-                n_embd + start..n_embd + end
-            ]));
-            v.slice_mut(s![.., h, .., ..]).assign(&qkv.slice(s![
-                ..,
-                ..,
-                2 * n_embd + start..2 * n_embd + end
-            ]));
-        }
+        let (q, k, v) = self.pack_qkv(&qkv);
+        drop(qkv);
 
         let scale = 1.0 / (self.head_size as f32).sqrt();
-        let mut att_probs = Array4::zeros((batch, self.n_head, time, time));
-        for (b, mut out) in att_probs.outer_iter_mut().enumerate() {
-            for (h, mut out) in out.outer_iter_mut().enumerate() {
-                let q_head = q.slice(s![b, h, .., ..]);
-                let k_head = k.slice(s![b, h, .., ..]);
+        let heads = batch * self.n_head;
+        let mut att_probs = Array3::zeros((heads, time, time));
+        let mask = self.causal_mask.slice(s![..time, ..time]);
+        let head_score_size = time * time;
+        att_probs
+            .as_slice_memory_order_mut()
+            .expect("attention probabilities should be contiguous")
+            .par_chunks_mut(head_score_size)
+            .enumerate()
+            .for_each(|(head_idx, out)| {
+                let q_head = q.index_axis(Axis(0), head_idx);
+                let k_head = k.index_axis(Axis(0), head_idx);
+                let mut out = ArrayViewMut2::from_shape((time, time), out).unwrap();
                 out.assign(&q_head.dot(&k_head.t()));
                 out *= scale;
-                out.outer_iter_mut().enumerate().for_each(|(i, mut row)| {
-                    row.slice_mut(s![i + 1..]).fill(f32::NEG_INFINITY);
+                Zip::from(&mut out).and(&mask).for_each(|score, masked| {
+                    if *masked {
+                        *score = f32::NEG_INFINITY;
+                    }
+                });
+                out.outer_iter_mut().for_each(|mut row| {
                     softmax_slice(&mut row);
                 });
-            }
-        }
+            });
 
         let (att_dropped, att_dropout_mask) = dropout(&att_probs, dropout_v, training, rng);
         let mut context = Array3::zeros((batch, time, n_embd));
-        for (b, out) in att_dropped.outer_iter().enumerate() {
-            for (h, _) in out.outer_iter().enumerate() {
-                let start = h * self.head_size;
-                let head_context =
-                    att_dropped
-                        .slice(s![b, h, .., ..])
-                        .dot(&v.slice(s![b, h, .., ..]));
-                let end = start + self.head_size;
-                context
-                    .slice_mut(s![b, .., start..end])
-                    .assign(&head_context);
-            }
-        }
+        let batch_context_size = time * n_embd;
+        context
+            .as_slice_memory_order_mut()
+            .expect("attention context should be contiguous")
+            .par_chunks_mut(batch_context_size)
+            .enumerate()
+            .for_each(|(b, out)| {
+                let mut out = ArrayViewMut2::from_shape((time, n_embd), out).unwrap();
+                for h in 0..self.n_head {
+                    let head_idx = b * self.n_head + h;
+                    let start = h * self.head_size;
+                    let end = start + self.head_size;
+                    let att_head = att_dropped.index_axis(Axis(0), head_idx);
+                    let v_head = v.index_axis(Axis(0), head_idx);
+                    let head_context = att_head.dot(&v_head);
+                    out.slice_mut(s![.., start..end]).assign(&head_context);
+                }
+            });
 
         let projected = self.proj.forward(&context);
         let (output, proj_dropout_mask) = dropout(&projected, dropout_v, training, rng);
@@ -446,33 +572,51 @@ impl MultiHeadSelfAttention {
     }
 
     fn backward(&mut self, cache: &AttentionCache, grad_output: &Array3<f32>) -> Array3<f32> {
-        let (batch, time, n_embd) = cache.input.dim();
+        let (batch, time, _) = cache.input.dim();
         let mut grad_projected = grad_output.clone();
         if let Some(mask) = &cache.proj_dropout_mask {
             grad_projected *= mask;
         }
 
         let grad_context = self.proj.backward(&cache.context, &grad_projected);
-        let mut grad_q: Array4<f32> = Array4::zeros(cache.q.dim());
-        let mut grad_k: Array4<f32> = Array4::zeros(cache.k.dim());
-        let mut grad_v: Array4<f32> = Array4::zeros(cache.v.dim());
-        let mut grad_att_dropped: Array4<f32> = Array4::zeros(cache.att_probs.dim());
+        let heads = batch * self.n_head;
+        let mut grad_q = Array3::zeros((heads, time, self.head_size));
+        let mut grad_k = Array3::zeros((heads, time, self.head_size));
+        let mut grad_v = Array3::zeros((heads, time, self.head_size));
+        let mut grad_att_dropped = Array3::zeros(cache.att_probs.dim());
+        let head_score_size = time * time;
+        let head_values = time * self.head_size;
 
-        for (b, mut out) in grad_att_dropped.outer_iter_mut().enumerate() {
-            for (h, mut out) in out.outer_iter_mut().enumerate() {
+        grad_att_dropped
+            .as_slice_memory_order_mut()
+            .expect("attention gradient should be contiguous")
+            .par_chunks_mut(head_score_size)
+            .zip(
+                grad_v
+                    .as_slice_memory_order_mut()
+                    .expect("value gradient should be contiguous")
+                    .par_chunks_mut(head_values),
+            )
+            .enumerate()
+            .for_each(|(head_idx, (att_out, v_out))| {
+                let b = head_idx / self.n_head;
+                let h = head_idx % self.n_head;
                 let start = h * self.head_size;
                 let end = start + self.head_size;
                 let grad_context_head = grad_context.slice(s![b, .., start..end]);
-                let v_head = cache.v.slice(s![b, h, .., ..]);
-                let att_head = cache.att_dropped.slice(s![b, h, .., ..]);
+                let v_head = cache.v.index_axis(Axis(0), head_idx);
+                let att_head = cache.att_dropped.index_axis(Axis(0), head_idx);
 
                 let grad_att_head = grad_context_head.dot(&v_head.t());
                 let grad_v_head = att_head.t().dot(&grad_context_head);
 
-                out.assign(&grad_att_head);
-                grad_v.slice_mut(s![b, h, .., ..]).assign(&grad_v_head);
-            }
-        }
+                ArrayViewMut2::from_shape((time, time), att_out)
+                    .unwrap()
+                    .assign(&grad_att_head);
+                ArrayViewMut2::from_shape((time, self.head_size), v_out)
+                    .unwrap()
+                    .assign(&grad_v_head);
+            });
 
         let mut grad_att = grad_att_dropped;
         if let Some(mask) = &cache.att_dropout_mask {
@@ -482,52 +626,29 @@ impl MultiHeadSelfAttention {
         let scale = 1.0 / (self.head_size as f32).sqrt();
         let mut grad_scores = Array2::zeros((time, time));
 
-        for (b, (mut q_out, mut k_out)) in grad_q
-            .outer_iter_mut()
-            .zip(grad_k.outer_iter_mut())
-            .enumerate()
-        {
-            for (h, (mut q_out, mut k_out)) in q_out
-                .outer_iter_mut()
-                .zip(k_out.outer_iter_mut())
-                .enumerate()
-            {
-                for i in 0..time {
-                    let grad_att_row = grad_att.slice(s![b, h, i, ..]);
-                    let att_probs_row = cache.att_probs.slice(s![b, h, i, ..]);
-                    let weighted_grad = grad_att_row.dot(&att_probs_row);
-
-                    for j in 0..=i {
-                        grad_scores[[i, j]] = scale
-                            * cache.att_probs[[b, h, i, j]]
-                            * (grad_att[[b, h, i, j]] - weighted_grad);
-                    }
+        for head_idx in 0..heads {
+            grad_scores.fill(0.0);
+            for i in 0..time {
+                let p = cache.att_probs.slice(s![head_idx, i, ..]);
+                let g = grad_att.slice(s![head_idx, i, ..]);
+                let dot = g.dot(&p);
+                let mut row = grad_scores.slice_mut(s![i, ..]);
+                row.assign(&(&p * &(g.to_owned() - dot)));
+                row *= scale;
+                if i + 1 < time {
+                    row.slice_mut(s![i + 1..]).fill(0.0);
                 }
-
-                let q_head = cache.q.slice(s![b, h, .., ..]);
-                let k_head = cache.k.slice(s![b, h, .., ..]);
-                let grad_q_head = grad_scores.dot(&k_head);
-                let grad_k_head = grad_scores.t().dot(&q_head);
-                q_out.assign(&grad_q_head);
-                k_out.assign(&grad_k_head);
             }
+
+            let q_head = cache.q.index_axis(Axis(0), head_idx);
+            let k_head = cache.k.index_axis(Axis(0), head_idx);
+            let grad_q_head = grad_scores.dot(&k_head);
+            let grad_k_head = grad_scores.t().dot(&q_head);
+            grad_q.slice_mut(s![head_idx, .., ..]).assign(&grad_q_head);
+            grad_k.slice_mut(s![head_idx, .., ..]).assign(&grad_k_head);
         }
 
-        let mut grad_qkv = Array3::zeros((batch, time, 3 * n_embd));
-        for h in 0..self.n_head {
-            let start = h * self.head_size;
-            let end = start + self.head_size;
-            grad_qkv
-                .slice_mut(s![.., .., start..end])
-                .assign(&grad_q.slice(s![.., h, .., ..]));
-            grad_qkv
-                .slice_mut(s![.., .., n_embd + start..n_embd + end])
-                .assign(&grad_k.slice(s![.., h, .., ..]));
-            grad_qkv
-                .slice_mut(s![.., .., 2 * n_embd + start..2 * n_embd + end])
-                .assign(&grad_v.slice(s![.., h, .., ..]));
-        }
-
+        let grad_qkv = self.unpack_qkv_grads(&grad_q, &grad_k, &grad_v, batch, time);
         self.qkv.backward(&cache.input, &grad_qkv)
     }
 
@@ -610,8 +731,8 @@ impl FeedForward {
 }
 
 struct BlockCache {
-    input: Array3<f32>,
-    residual_after_attention: Array3<f32>,
+    ln1: LayerNormCache,
+    ln2: LayerNormCache,
     attention: AttentionCache,
     feed_forward: FeedForwardCache,
 }
@@ -624,10 +745,10 @@ struct Block {
 }
 
 impl Block {
-    fn new<R: Rng + ?Sized>(n_embd: usize, n_head: usize, rng: &mut R) -> Self {
+    fn new<R: Rng + ?Sized>(n_embd: usize, n_head: usize, block_size: usize, rng: &mut R) -> Self {
         Self {
             ln1: LayerNorm::new(n_embd),
-            attention: MultiHeadSelfAttention::new(n_embd, n_head, rng),
+            attention: MultiHeadSelfAttention::new(n_embd, n_head, block_size, rng),
             ln2: LayerNorm::new(n_embd),
             feed_forward: FeedForward::new(n_embd, rng),
         }
@@ -640,19 +761,19 @@ impl Block {
         dropout: f32,
         rng: &mut R,
     ) -> (Array3<f32>, BlockCache) {
-        let ln1_output = self.ln1.forward(input);
+        let (ln1_output, ln1_cache) = self.ln1.forward(input);
         let (attention_output, attention_cache) =
             self.attention.forward(&ln1_output, training, dropout, rng);
         let residual_after_attention = input + &attention_output;
-        let ln2_output = self.ln2.forward(&residual_after_attention);
+        let (ln2_output, ln2_cache) = self.ln2.forward(&residual_after_attention);
         let (feed_forward_output, feed_forward_cache) =
             self.feed_forward
                 .forward(&ln2_output, training, dropout, rng);
         let output = &residual_after_attention + &feed_forward_output;
 
         let cache = BlockCache {
-            input: input.clone(),
-            residual_after_attention,
+            ln1: ln1_cache,
+            ln2: ln2_cache,
             attention: attention_cache,
             feed_forward: feed_forward_cache,
         };
@@ -663,16 +784,14 @@ impl Block {
     fn backward(&mut self, cache: &BlockCache, grad_output: &Array3<f32>) -> Array3<f32> {
         let mut grad_residual_after_attention = grad_output.clone();
         let grad_feed_forward = self.feed_forward.backward(&cache.feed_forward, grad_output);
-        let grad_ln2_input = self
-            .ln2
-            .backward(&cache.residual_after_attention, &grad_feed_forward);
+        let grad_ln2_input = self.ln2.backward(&cache.ln2, &grad_feed_forward);
         grad_residual_after_attention += &grad_ln2_input;
 
         let mut grad_input = grad_residual_after_attention.clone();
         let grad_attention = self
             .attention
             .backward(&cache.attention, &grad_residual_after_attention);
-        let grad_ln1_input = self.ln1.backward(&cache.input, &grad_attention);
+        let grad_ln1_input = self.ln1.backward(&cache.ln1, &grad_attention);
         grad_input += &grad_ln1_input;
 
         grad_input
@@ -705,7 +824,7 @@ struct GptConfig {
 
 struct GptCache {
     idx: Array2<usize>,
-    before_final_norm: Array3<f32>,
+    final_norm: LayerNormCache,
     final_norm_output: Array3<f32>,
     blocks: Vec<BlockCache>,
 }
@@ -722,7 +841,7 @@ struct GptLanguageModel {
 impl GptLanguageModel {
     fn new<R: Rng + ?Sized>(config: GptConfig, rng: &mut R) -> Self {
         let blocks = (0..config.n_layer)
-            .map(|_| Block::new(config.n_embd, config.n_head, rng))
+            .map(|_| Block::new(config.n_embd, config.n_head, config.block_size, rng))
             .collect();
 
         Self {
@@ -748,13 +867,31 @@ impl GptLanguageModel {
         );
 
         let mut x = Array3::zeros((batch, time, self.config.n_embd));
-        for (b, mut out) in x.outer_iter_mut().enumerate() {
-            for (t, mut out) in out.outer_iter_mut().enumerate() {
-                let token = idx[[b, t]];
-                out.assign(&self.token_embedding.value.row(token));
-                out += &self.position_embedding.value.row(t);
-            }
-        }
+        let token_values = self
+            .token_embedding
+            .value
+            .as_slice_memory_order()
+            .expect("token embeddings should be contiguous");
+        let position_values = self
+            .position_embedding
+            .value
+            .as_slice_memory_order()
+            .expect("position embeddings should be contiguous");
+        let idx_values = idx
+            .as_slice_memory_order()
+            .expect("token indices should be contiguous");
+        x.as_slice_memory_order_mut()
+            .expect("embedding output should be contiguous")
+            .par_chunks_mut(self.config.n_embd)
+            .enumerate()
+            .for_each(|(token_idx, out)| {
+                let token_offset = idx_values[token_idx] * self.config.n_embd;
+                let position_offset = (token_idx % time) * self.config.n_embd;
+                for channel in 0..self.config.n_embd {
+                    out[channel] = token_values[token_offset + channel]
+                        + position_values[position_offset + channel];
+                }
+            });
 
         let mut block_caches = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
@@ -763,12 +900,11 @@ impl GptLanguageModel {
             x = next_x;
         }
 
-        let before_final_norm = x;
-        let final_norm_output = self.ln_f.forward(&before_final_norm);
+        let (final_norm_output, final_norm_cache) = self.ln_f.forward(&x);
         let logits = self.lm_head.forward(&final_norm_output);
         let cache = GptCache {
             idx: idx.clone(),
-            before_final_norm,
+            final_norm: final_norm_cache,
             final_norm_output,
             blocks: block_caches,
         };
@@ -804,7 +940,7 @@ impl GptLanguageModel {
 
     fn backward(&mut self, cache: &GptCache, grad_logits: &Array3<f32>) {
         let mut grad = self.lm_head.backward(&cache.final_norm_output, grad_logits);
-        grad = self.ln_f.backward(&cache.before_final_norm, &grad);
+        grad = self.ln_f.backward(&cache.final_norm, &grad);
 
         for (block, block_cache) in self.blocks.iter_mut().rev().zip(cache.blocks.iter().rev()) {
             grad = block.backward(block_cache, &grad);
@@ -861,8 +997,8 @@ impl GptLanguageModel {
 
     fn step(&mut self, optimizer: &mut AdamW) {
         let step = optimizer.next_step();
-        self.token_embedding.step(step);
-        self.position_embedding.step(step);
+        self.token_embedding.step_without_weight_decay(step);
+        self.position_embedding.step_without_weight_decay(step);
         for block in &mut self.blocks {
             block.step(step);
         }
@@ -1146,5 +1282,56 @@ mod tests {
         assert!(loss.is_finite());
         assert_eq!(generated.len(), 6);
         assert!(generated.iter().all(|token| *token < config.vocab_size));
+    }
+
+    #[test]
+    fn adamw_decays_only_matrix_weights() {
+        let mut rng = SmallRng::seed_from_u64(SEED);
+        let config = GptConfig {
+            vocab_size: 7,
+            block_size: 4,
+            n_embd: 8,
+            n_head: 2,
+            n_layer: 1,
+            dropout: 0.0,
+        };
+        let mut model = GptLanguageModel::new(config, &mut rng);
+        model
+            .blocks
+            .first_mut()
+            .unwrap()
+            .attention
+            .proj
+            .bias
+            .as_mut()
+            .unwrap()
+            .value
+            .fill(1.0);
+
+        let token_embedding = model.token_embedding.value.clone();
+        let position_embedding = model.position_embedding.value.clone();
+        let ln_gamma = model.blocks[0].ln1.gamma.value.clone();
+        let proj_bias = model.blocks[0]
+            .attention
+            .proj
+            .bias
+            .as_ref()
+            .unwrap()
+            .value
+            .clone();
+        let qkv_weight = model.blocks[0].attention.qkv.weight.value.clone();
+
+        model.zero_grad();
+        let mut optimizer = AdamW::new(1e-3, 0.1);
+        model.step(&mut optimizer);
+
+        assert_eq!(model.token_embedding.value, token_embedding);
+        assert_eq!(model.position_embedding.value, position_embedding);
+        assert_eq!(model.blocks[0].ln1.gamma.value, ln_gamma);
+        assert_eq!(
+            model.blocks[0].attention.proj.bias.as_ref().unwrap().value,
+            proj_bias
+        );
+        assert_ne!(model.blocks[0].attention.qkv.weight.value, qkv_weight);
     }
 }
